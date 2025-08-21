@@ -122,9 +122,13 @@ while True:
         while(i < int(new_pos)):
             # test if it is in max pos or min pos
             if(not min_pos_pin.value() and (direction == "contrair")):
+                step_pin.duty_u16(0)
+                step_pin.freq(speed)
                 print("pistao ja esta totalmente contraido\n")
                 break
             elif(not max_pos_pin.value() and (direction == "expandir")):
+                step_pin.duty_u16(0)
+                step_pin.freq(speed)
                 print("pistao ja esta totalmente expandido\n")
                 break
             

@@ -41,7 +41,6 @@ Definicao de pinos e frequencia inicial do pwm
 step_pin = PWM(Pin(3))
 step_pin.freq(speed)
 step_pin.duty_u16(0)
-sleep_time = 1 /step_pin.freq()
 dir_pin = Pin(2, Pin.OUT)
 
 
@@ -62,7 +61,7 @@ cur_pos = 100
 
 while True:
     try:
-        """
+        
         #goes to minimal position
         dir_pin.value(1)
         i = 0
@@ -91,7 +90,7 @@ while True:
                 step_pin.freq(500 + 20*i)
 
         step_pin.duty_u16(0)
-        """
+        
 
 
         """

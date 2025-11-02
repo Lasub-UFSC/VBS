@@ -1,88 +1,66 @@
 /**
  * @file MKS_SERVO42C_UART_Bridge.ino
- * @version 1.4.3
+ * @version 1.4.4 (Smart Response Parser)
  * @author Lucas Barcaro (comments AI generated, if any error, please contact the author)
  * @date October 2025
  *
- * @brief Provides a full-featured, human-readable serial command interface
- * for the MKS SERVO42C closed-loop stepper driver via UART.
- *
- * This firmware runs on an ESP32 and acts as a serial bridge.
- * It translates intuitive string commands (e.g., "move 3200 30") into
- * the binary packet format required by the driver, including automatic
- * checksum calculation.
- *
- * This architecture is data-driven, using 'dictionaries' (const arrays
- * of structs) to map commands to their respective handlers, making the
- * code clean, scalable, and easy to maintain.
+ * @brief This version adds a smart parser for driver responses.
+ * Instead of printing raw hex bytes, it validates the checksum,
+ * determines the message type based on its length, and prints a
+ * human-readable interpretation.
  *
  * @features
- * - Human-readable command parser (e.g., "enable", "set_kp 1500")
- * - Automatic 8-bit checksum calculation
- * - Full implementation of all commands from the V1.1.2 manual
- * - Data-driven routing for simple and single/multi-byte arg commands
- * - Robust error handling with `int8_t` status codes
- * - Interactive, multi-level 'help' menu
- * - Non-blocking serial read for driver responses
+ * - Human-readable command parser.
+ * - Automatic checksum calculation (sending).
+ * - Automatic checksum validation (receiving).
+ * - Smart response parser (e.g., "Command OK", "Encoder Value: 16384").
+ * - Data-driven routing for commands.
+ * - Interactive 'help' menu.
  */
 
 // --- UART2 (Driver) Settings ---
-#define DRIVER_BAUD_RATE 38400                // Default baud for MKS SERVO42C
+#define DRIVER_BAUD_RATE 38400
 #define UART2_RX_PIN 16
 #define UART2_TX_PIN 17
 
 // --- Receive Buffer Settings ---
-#define RX_BUFFER_SIZE 64                     // Max expected bytes in a single driver response
+#define RX_BUFFER_SIZE 64
 byte rxBuffer[RX_BUFFER_SIZE];
 int rxBufferIndex                 = 0;
 unsigned long lastByteTime        = 0;
-const long messageTimeout         = 20;       // 20ms of silence = end of message
+const long messageTimeout         = 20;
 
 // --- Driver Protocol Constants ---
-const byte DRIVER_ADDR            = 0xE0;     // Default driver address
-const byte MAX_SPEED_VALUE        = 0x7F;     // 127 (7-bit value)
-const int MAX_TORQUE_VALUE        = 0x0480;   // 1152 (from manual)
+const byte DRIVER_ADDR            = 0xE0;
+const byte MAX_SPEED_VALUE        = 0x7F;
+const int MAX_TORQUE_VALUE        = 0x0480;
 
 // =================================================================
 // STATUS CODES
 // =================================================================
-/**
- * @brief Defines the return codes for command parsing functions.
- * Provides detailed error feedback instead of a simple true/false.
- */
-const int8_t STATUS_OK            =  0; // Command successful and sent
-const int8_t ERR_UNKNOWN_COMMAND  = -1; // Command string was not recognized
-const int8_t ERR_INVALID_ARGS     = -2; // Missing, empty, or malformed arguments
-const int8_t ERR_ARG_OUT_OF_RANGE = -3; // Argument value is outside the allowed range
+const int8_t STATUS_OK             =  0;
+const int8_t ERR_UNKNOWN_COMMAND   = -1;
+const int8_t ERR_INVALID_ARGS      = -2;
+const int8_t ERR_ARG_OUT_OF_RANGE  = -3;
 
 // =================================================================
 // COMMAND DICTIONARIES (Data-Driven Routing)
 // =================================================================
-
-/**
- * @struct SimpleCommand
- * @brief Dictionary for commands that have NO user arguments
- * (e.g., "enable", "read_encoder").
- */
 struct SimpleCommand {
-  const char* name;                     // The human-readable command
-  byte bytes[3];                        // The command packet bytes (excluding Addr/Checksum)
-  int length;                           // The number of bytes in the packet
+  const char* name;
+  byte bytes[3];
+  int length;
 };
-
 const SimpleCommand simpleCommands[] = {
-  // Control
   {"enable",       {0xF3, 0x01}, 2},
   {"disable",      {0xF3, 0x00}, 2},
   {"stop",         {0xF7},       1},
-  // Feedback
   {"read_encoder", {0x30},       1},
   {"read_pulses",  {0x33},       1},
   {"read_error_angle", {0x39},   1},
   {"read_en_status", {0x3A},     1},
   {"release_protection", {0x3D}, 1},
   {"read_protection_state", {0x3E},1},
-  // Config
   {"calibrate",    {0x80, 0x00}, 2},
   {"restore_defaults", {0x3F},   1},
   {"set_zero",     {0x91, 0x00}, 2},
@@ -92,17 +70,12 @@ const SimpleCommand simpleCommands[] = {
 };
 const int numSimpleCommands = sizeof(simpleCommands) / sizeof(simpleCommands[0]);
 
-/**
- * @struct SingleByteArgCommand
- * @brief Dictionary for commands with ONE 1-byte argument
- * (e.g., "set_baud 4").
- */
 struct SingleByteArgCommand {
   const char* name;
   byte functionCode;
   int minVal;
   int maxVal;
-  const char* errorMsg;         // Help text for error reporting
+  const char* errorMsg;
 };
 const SingleByteArgCommand singleByteCommands[] = {
   {"set_motor_type", 0x81, 0, 1, "type (0=0.9deg, 1=1.8deg)"},
@@ -122,17 +95,12 @@ const SingleByteArgCommand singleByteCommands[] = {
 };
 const int numSingleByteCommands = sizeof(singleByteCommands) / sizeof(singleByteCommands[0]);
 
-/**
- * @struct TwoByteArgCommand
- * @brief Dictionary for commands with ONE 2-byte (uint16_t) argument
- * (e.g., "set_kp 1500").
- */
 struct TwoByteArgCommand {
   const char* name;
   byte functionCode;
   long minVal;
   long maxVal;
-  const char* errorMsg;         // Help text for error reporting
+  const char* errorMsg;
 };
 const TwoByteArgCommand twoByteCommands[] = {
   {"set_kp",        0xA1, 0, 65535, "Kp (0-65535)"},
@@ -147,80 +115,48 @@ const int numTwoByteCommands = sizeof(twoByteCommands) / sizeof(twoByteCommands[
 // =================================================================
 // SETUP & MAIN LOOP
 // =================================================================
-
-/**
- * @brief Initializes serial ports (to PC and to Driver)
- * and prints the welcome message.
- */
 void setup() {
-  // Serial to PC (for user interface)
   Serial.begin(115200);
   while (!Serial);
-
-  // Serial to MKS Driver (Hardware UART2)
   Serial2.begin(DRIVER_BAUD_RATE, SERIAL_8N1, UART2_RX_PIN, UART2_TX_PIN);
-
-  Serial.println("\n--- MKS Controller (v4.3 - Clean Comments) ---");
+  Serial.println("\n--- MKS Controller (v4.4 - Smart Parser) ---");
   Serial.println("Type 'help' for a list of commands.");
 }
 
-/**
- * @brief Main execution loop.
- * 1. Checks for new commands from the user (PC Serial).
- * 2. Checks for new responses from the driver (Driver Serial2).
- */
+
 void loop() {
-  // Check for user input from the Serial Monitor
   if (Serial.available()) {
     String rawInput = Serial.readStringUntil('\n');
     rawInput.trim();
     if (rawInput.length() > 0) {
-      Serial.print("\n> ");             // Echo the command
+      Serial.print("\n> ");
       Serial.println(rawInput);
-      parseAndSendCommand(rawInput);    // Process the command
+      parseAndSendCommand(rawInput);
     }
   }
-
-  // Check for any response data from the driver
+  // handleDriverResponses() agora fará o parsing inteligente
   handleDriverResponses();
 }
 
 // =================================================================
 // MASTER COMMAND ROUTER
 // =================================================================
-
-/**
- * @brief Parses the user's raw input string and routes it to the correct handler.
- * This is the main "switchboard" of the application. It attempts
- * to find a match in the following order:
- * 1. Custom Handlers (help, move, spin)
- * 2. Single-Byte Argument Dictionary
- * 3. Two-Byte Argument Dictionary
- * 4. Simple (No-Argument) Dictionary
- *
- * @param line The raw command string (e.g., "move 3200 30" or "help 1").
- */
 void parseAndSendCommand(String line) {
   line.toLowerCase();
-
-  // Split the line into a "command" and "arguments"
   String command = "";
   String args = "";
   int firstSpace = line.indexOf(' ');
 
   if (firstSpace == -1) {
-    command = line;                           // No spaces, so no args (e.g., "enable")
+    command = line;
   } else {
-    command = line.substring(0, firstSpace);  // "move"
-    args = line.substring(firstSpace + 1);    // "3200 30"
+    command = line.substring(0, firstSpace);
+    args = line.substring(firstSpace + 1);
     args.trim();
   }
 
-  int8_t returnVal = ERR_UNKNOWN_COMMAND;     // Assume failure until a handler succeeds
+  int8_t returnVal = ERR_UNKNOWN_COMMAND;
 
-  // --- Routing Block ---
-
-  // 1. Handle commands with custom logic (help, move, spin)
   if (command == "help") {
     returnVal = handleHelpCommand(args);
   } 
@@ -230,26 +166,17 @@ void parseAndSendCommand(String line) {
   else if (command == "spin") {
     returnVal = handleSpinCommand(args);
   } 
-  // 2. If not a custom command, search the data-driven dictionaries
   else {
-    // Try searching 1-byte-arg commands (e.g., "set_baud 4")
     returnVal = findAndSendSingleByteArgCommand(command, args);
-    
-    // If not found, try 2-byte-arg commands (e.g., "set_kp 1500")
     if (returnVal == ERR_UNKNOWN_COMMAND) {
       returnVal = findAndSendTwoByteArgCommand(command, args);
     }
-
-    // If still not found, try simple (no-arg) commands (e.g., "enable")
     if (returnVal == ERR_UNKNOWN_COMMAND) {
       returnVal = findAndSendSimpleCommand(command);
     }
   }
 
-  // 3. Final Error Feedback
   if (returnVal == ERR_UNKNOWN_COMMAND) {
-    // Only print "not recognized" if no handler (including helpers)
-    // has already printed a more specific error.
     Serial.println("Error: Command '" + command + "' not recognized.");
   }
 }
@@ -257,18 +184,10 @@ void parseAndSendCommand(String line) {
 // =================================================================
 // COMMAND DICTIONARY "FINDER" FUNCTIONS (Routing Logic)
 // =================================================================
-
-/**
- * @brief Searches the 1-byte-arg dictionary and calls the generic handler.
- * @param command The command name to find (e.g., "set_baud").
- * @param args The argument string (e.g., "4").
- * @return int8_t Status code (STATUS_OK, ERR_INVALID_ARGS, etc.)
- */
 int8_t findAndSendSingleByteArgCommand(String command, String args) {
   int8_t returnVal = ERR_UNKNOWN_COMMAND;
   for (int i = 0; i < numSingleByteCommands; i++) {
     if (command == singleByteCommands[i].name) {
-      // Found! Call the generic handler with the dictionary data.
       returnVal = handleSingleByteArgCommand(
         args,
         singleByteCommands[i].functionCode,
@@ -276,23 +195,17 @@ int8_t findAndSendSingleByteArgCommand(String command, String args) {
         singleByteCommands[i].maxVal,
         singleByteCommands[i].errorMsg
       );
-      break; // Exit loop
+      break; 
     }
   }
   return returnVal;
 }
 
-/**
- * @brief Searches the 2-byte-arg dictionary and calls the generic handler.
- * @param command The command name to find (e.g., "set_kp").
- * @param args The argument string (e.g., "1500").
- * @return int8_t Status code (STATUS_OK, ERR_INVALID_ARGS, etc.)
- */
+
 int8_t findAndSendTwoByteArgCommand(String command, String args) {
   int8_t returnVal = ERR_UNKNOWN_COMMAND;
   for (int i = 0; i < numTwoByteCommands; i++) {
     if (command == twoByteCommands[i].name) {
-      // Found! Call the generic handler with the dictionary data.
       returnVal = handleTwoByteArgCommand(
         args,
         twoByteCommands[i].functionCode,
@@ -300,52 +213,36 @@ int8_t findAndSendTwoByteArgCommand(String command, String args) {
         twoByteCommands[i].maxVal,
         twoByteCommands[i].errorMsg
       );
-      break; // Exit loop
+      break;
     }
   }
   return returnVal;
 }
 
-/**
- * @brief Searches the simple command dictionary and sends the packet.
- * @param command The name of the command to find (e.g., "enable").
- * @return int8_t Returns STATUS_OK if found, or ERR_UNKNOWN_COMMAND if not.
- */
+
 int8_t findAndSendSimpleCommand(String command) {
   int8_t returnVal = ERR_UNKNOWN_COMMAND; 
-
   for (int i = 0; i < numSimpleCommands; i++) {
     if (command == simpleCommands[i].name) {
-      // 1. Command found! Assemble the packet: [ADDR] + [command bytes]
       int cmdLength = simpleCommands[i].length;
-      byte packet[1 + cmdLength];                 // 1 for the ADDR
-      
+      byte packet[1 + cmdLength]; 
       packet[0] = DRIVER_ADDR;
-      // 2. Copy the command bytes (e.g., {0xF3, 0x01}) into the packet
       memcpy(&packet[1], simpleCommands[i].bytes, cmdLength);
-      
-      // 3. Send
       sendPacketWithChecksum(packet, sizeof(packet));
       returnVal = STATUS_OK; 
-      break;                                      // Exit the 'for' loop
+      break; 
     }
   }
   return returnVal;
 }
 
 // =================================================================
-// COMMAND LOGIC HANDLERS (Custom & Generic)
+// COMMAND LOGIC HANDLERS (Unchanged from v4.3)
 // =================================================================
-
-/**
- * @brief Handles the 'help' command's interactive menu.
- * @param args The argument string (e.g., "" or "1" or "5").
- * @return int8_t Status code (STATUS_OK or ERR_ARG_OUT_OF_RANGE).
- */
 int8_t handleHelpCommand(String args) {
     int8_t returnVal = STATUS_OK;
     if (args.length() == 0) {
-        printHelp_Main(); // Show main menu
+        printHelp_Main();
     } else {
         int category = args.toInt();
         switch (category) {
@@ -363,44 +260,30 @@ int8_t handleHelpCommand(String args) {
     return returnVal;
 }
 
-/**
- * @brief Parses arguments for the 'move' command (custom logic).
- * @param args The string containing arguments (e.g., "3200 30").
- * @return int8_t A status code (STATUS_OK, ERR_INVALID_ARGS, etc.)
- */
+
 int8_t handleMoveCommand(String args) {
   int8_t returnVal = ERR_INVALID_ARGS; 
   int spaceIndex = args.indexOf(' ');
-
   if (spaceIndex == -1) {
     Serial.println("Error: 'move' requires <pulses> and <speed> (e.g., move 3200 30)");
   } else {
-    // 1. Parse arguments
     long pulses = args.substring(0, spaceIndex).toInt();
     int speed_raw = args.substring(spaceIndex + 1).toInt();
     byte speed_val = (byte)abs(speed_raw);
-
-    // 2. Validate arguments
     if (speed_val > MAX_SPEED_VALUE) {
       Serial.println("Error: Speed must be between -" + String(MAX_SPEED_VALUE) + " and " + String(MAX_SPEED_VALUE));
       returnVal = ERR_ARG_OUT_OF_RANGE;
     } else {
-      // 3. Assemble packet
       byte packet[7]; 
       packet[0] = DRIVER_ADDR;
-      packet[1] = 0xFD;                         // 'Run by serial' command
-      
+      packet[1] = 0xFD; 
       byte direction = (pulses < 0) ? 1 : 0;
       pulses = abs(pulses);
-      packet[2] = (direction << 7) | speed_val; // VAL byte
-
-      // Split 'long' pulses into 4 bytes (MSB first)
-      packet[3] = (pulses >> 24) & 0xFF; 
+      packet[2] = (direction << 7) | speed_val;
+      packet[3] = (pulses >> 24) & 0xFF;
       packet[4] = (pulses >> 16) & 0xFF;
       packet[5] = (pulses >> 8) & 0xFF;
       packet[6] = pulses & 0xFF;         
-      
-      // 4. Send
       sendPacketWithChecksum(packet, sizeof(packet));
       returnVal = STATUS_OK; 
     }
@@ -408,17 +291,11 @@ int8_t handleMoveCommand(String args) {
   return returnVal;
 }
 
-/**
- * @brief Parses arguments for the 'spin' command (custom logic).
- * @param args The string containing the speed (e.g., "10" or "-10").
- * @return int8_t A status code (STATUS_OK, ERR_INVALID_ARGS, etc.)
- */
+
 int8_t handleSpinCommand(String args) {
   int8_t returnVal = ERR_INVALID_ARGS;
   int speed_raw = args.toInt();
   byte speed_val = (byte)abs(speed_raw);
-
-  // 1. Validate arguments
   if (speed_raw == 0) {
     Serial.println("Error: 'spin' requires a non-zero speed (e.g., spin 10)");
   } 
@@ -427,32 +304,18 @@ int8_t handleSpinCommand(String args) {
     returnVal = ERR_ARG_OUT_OF_RANGE;
   } 
   else {
-    // 2. Assemble packet
     byte direction = (speed_raw < 0) ? 1 : 0;
-    byte val = (direction << 7) | speed_val;      // VAL byte
-    
-    byte packet[] = {DRIVER_ADDR, 0xF6, val};     // 'Constant speed' command
-    
-    // 3. Send
+    byte val = (direction << 7) | speed_val; 
+    byte packet[] = {DRIVER_ADDR, 0xF6, val};
     sendPacketWithChecksum(packet, sizeof(packet));
     returnVal = STATUS_OK;
   }
   return returnVal;
 }
 
-/**
- * @brief Generic handler for all "Set" commands that take a single byte argument.
- * @param args The user's argument string (must contain one number).
- * @param functionCode The command's function byte (e.g., 0x81).
- * @param minVal The minimum allowed value for the argument.
- * @param maxVal The maximum allowed value for the argument.
- * @param errorMsg A help string (e.g., "type (0-1)").
- * @return int8_t A status code (STATUS_OK, ERR_INVALID_ARGS, etc.)
- */
+
 int8_t handleSingleByteArgCommand(String args, byte functionCode, int minVal, int maxVal, const char* errorMsg) {
   int8_t returnVal = ERR_INVALID_ARGS;
-  
-  // 1. Validate arguments
   if (args.length() == 0) {
     Serial.println("Error: Missing argument. Usage: <cmd> " + String(errorMsg));
   } else {
@@ -461,11 +324,8 @@ int8_t handleSingleByteArgCommand(String args, byte functionCode, int minVal, in
       Serial.println("Error: Argument out of range. Must be " + String(errorMsg));
       returnVal = ERR_ARG_OUT_OF_RANGE;
     } else {
-      // 2. Assemble packet
       byte arg_val = (byte)arg_val_raw;
       byte packet[] = {DRIVER_ADDR, functionCode, arg_val};
-      
-      // 3. Send
       sendPacketWithChecksum(packet, sizeof(packet));
       returnVal = STATUS_OK;
     }
@@ -473,37 +333,23 @@ int8_t handleSingleByteArgCommand(String args, byte functionCode, int minVal, in
   return returnVal;
 }
 
-/**
- * @brief Generic handler for all "Set" commands that take two bytes (uint16_t).
- * @param args The user's argument string (must contain one number).
- * @param functionCode The command's function byte (e.g., 0xA1).
- * @param minVal The minimum allowed value for the argument.
- * @param maxVal The maximum allowed value for the argument.
- * @param errorMsg A help string (e.g., "Kp (0-65535)").
- * @return int8_t A status code (STATUS_OK, ERR_INVALID_ARGS, etc.)
- */
+
 int8_t handleTwoByteArgCommand(String args, byte functionCode, long minVal, long maxVal, const char* errorMsg) {
   int8_t returnVal = ERR_INVALID_ARGS;
-  
-  // 1. Validate arguments
   if (args.length() == 0) {
     Serial.println("Error: Missing argument. Usage: <cmd> " + String(errorMsg));
   } else {
-    long arg_val_raw = args.toInt(); // Use long to check 0-65535
+    long arg_val_raw = args.toInt();
     if (arg_val_raw < minVal || arg_val_raw > maxVal) {
       Serial.println("Error: Argument out of range. Must be " + String(errorMsg));
       returnVal = ERR_ARG_OUT_OF_RANGE;
     } else {
-      // 2. Assemble packet
       uint16_t arg_val = (uint16_t)arg_val_raw;
-      
-      byte packet[4]; // Addr, Func, Arg_Hi, Arg_Lo
+      byte packet[4]; 
       packet[0] = DRIVER_ADDR;
       packet[1] = functionCode;
-      packet[2] = (arg_val >> 8) & 0xFF;      // High Byte (MSB)
-      packet[3] = arg_val & 0xFF;             // Low Byte (LSB)
-      
-      // 3. Send
+      packet[2] = (arg_val >> 8) & 0xFF; 
+      packet[3] = arg_val & 0xFF;        
       sendPacketWithChecksum(packet, sizeof(packet));
       returnVal = STATUS_OK;
     }
@@ -515,81 +361,134 @@ int8_t handleTwoByteArgCommand(String args, byte functionCode, long minVal, long
 // =================================================================
 // AUXILIARY FUNCTIONS (Communication & UI)
 // =================================================================
-
-/**
- * @brief Sends a data packet to the driver, calculating and appending the checksum.
- * @param packetData The byte array of the command (e.g., {0xE0, 0xF3, 0x01}).
- * @param dataLength The total number of bytes in the packetData array.
- */
 void sendPacketWithChecksum(byte* packetData, int dataLength) {
   byte checksum = 0;
-  
   Serial.print("Sending Packet:   [ ");
   for (int i = 0; i < dataLength; i++) {
-    checksum += packetData[i];                    // Additive 8-bit checksum
-    
-    // Print the byte in HEX format
+    checksum += packetData[i];
     Serial.print("0x");
-    if (packetData[i] < 0x10) Serial.print("0");  // Add leading zero
+    if (packetData[i] < 0x10) Serial.print("0");
     Serial.print(packetData[i], HEX);
     Serial.print(" ");
   }
-
-  // Append the calculated checksum
   Serial.print("0x");
   if (checksum < 0x10) Serial.print("0");
   Serial.print(checksum, HEX);
   Serial.println(" ] (Checksum)");
-
-  // Send the data and the checksum byte to the driver
   Serial2.write(packetData, dataLength);
   Serial2.write(checksum);
 }
 
-/**
- * @brief Handles multi-byte responses from the driver (non-blocking).
- * Collects bytes from Serial2 into rxBuffer until a 'messageTimeout'
- * (20ms) of silence occurs, then prints the complete message.
- */
+
+// =================================================================
+// RESPONSE PARSING LOGIC (New)
+// =================================================================
 void handleDriverResponses() {
-  // 1. Read all available bytes into the buffer
   while (Serial2.available()) {
     if (rxBufferIndex < RX_BUFFER_SIZE) {
-      // Add byte to buffer and reset the timeout timer
       rxBuffer[rxBufferIndex] = Serial2.read();
       rxBufferIndex++;
       lastByteTime = millis();
     } else {
-      // Buffer overflow, discard the byte but reset timer
       Serial2.read();
       lastByteTime = millis();
     }
   }
 
-  // 2. Check if the message timeout has expired
   if (rxBufferIndex > 0 && (millis() - lastByteTime > messageTimeout)) {
-    // Message is complete, print it
-    Serial.print("Driver Response <- [ ");
-    for (int i = 0; i < rxBufferIndex; i++) {
+    parseAndPrintResponse(rxBuffer, rxBufferIndex);
+    rxBufferIndex = 0;
+  }
+}
+
+
+bool validateChecksum(byte* buffer, int length) {
+  byte checksum = 0;
+  for (int i = 0; i < length - 1; i++) {
+    checksum += buffer[i];
+  }
+  return (checksum == buffer[length - 1]);
+}
+
+
+void parseAndPrintResponse(byte* buffer, int length) {
+  if (!validateChecksum(buffer, length)) {
+    Serial.print("Driver Response -> [ CHECKSUM ERROR! Data: ");
+    for (int i = 0; i < length; i++) {
       Serial.print("0x");
-      if (rxBuffer[i] < 0x10) Serial.print("0");
-      Serial.print(rxBuffer[i], HEX);
+      if (buffer[i] < 0x10) Serial.print("0");
+      Serial.print(buffer[i], HEX);
       Serial.print(" ");
     }
     Serial.println("]");
-    
-    // 3. Reset the buffer for the next message
-    rxBufferIndex = 0; 
   }
+
+  switch (length) {
+    case 3:
+      parseStatusResponse(buffer);
+      break;
+    case 4:
+      parseAngleErrorResponse(buffer);
+      break;
+    case 8:
+      parseEncoderResponse(buffer);
+      break;
+    default:
+      Serial.print("Driver Response (Unknown Format) <- [ ");
+      for (int i = 0; i < length; i++) {
+        Serial.print("0x");
+        if (buffer[i] < 0x10) Serial.print("0");
+        Serial.print(buffer[i], HEX);
+        Serial.print(" ");
+      }
+      Serial.println("]");
+  }
+}
+
+
+void parseStatusResponse(byte* buffer) {
+  byte status = buffer[1];
+  Serial.print("Driver Response -> Status: ");
+  switch (status) {
+    case 0x00:
+      Serial.println("Command FAILED");
+      break;
+    case 0x01:
+      Serial.println("Command OK / Move STARTED");
+      break;
+    case 0x02:
+      Serial.println("Move COMPLETE");
+      break;
+    default:
+      Serial.println("Unknown status code 0x" + String(status, HEX));
+  }
+}
+
+
+void parseEncoderResponse(byte* buffer) {
+  
+  int32_t carry = (int32_t)(buffer[1] << 24 | buffer[2] << 16 | buffer[3] << 8 | buffer[4]);
+  uint16_t value = (uint16_t)(buffer[5] << 8 | buffer[6]);
+  
+  Serial.println("Driver Response -> Encoder Read:");
+  Serial.println("  Carry (Revolutions): " + String(carry));
+  Serial.println("  Value (Position 0-65535): " + String(value));
+}
+
+
+void parseAngleErrorResponse(byte* buffer) {
+  int16_t error = (int16_t)(buffer[1] << 8 | buffer[2]);
+  
+  float error_degrees = (float)error / 182.044; 
+  
+  Serial.println("Driver Response -> Angle Error Read:");
+  Serial.println("  Raw Error Value: " + String(error));
+  Serial.println("  Angle Error (deg): " + String(error_degrees, 3));
 }
 
 // =================================================================
 // HELP MENU PRINTING FUNCTIONS
 // =================================================================
-
-/**
- * @brief Prints the MAIN help menu (categories).
- */
 void printHelp_Main() {
   Serial.println("--- MKS Controller Help Menu ---");
   Serial.println("Usage: help <category_number>");
@@ -600,10 +499,6 @@ void printHelp_Main() {
   Serial.println(" 5. Configuration (Driver) Commands");
   Serial.println("--------------------------------");
 }
-
-/**
- * @brief Prints help for Category 1.
- */
 void printHelp_Motion() {
   Serial.println("--- 1. Motion Commands ---");
   Serial.println("enable                 : Enables the motor");
@@ -615,10 +510,6 @@ void printHelp_Motion() {
   Serial.println("set_acc <0-65535>      : Sets acceleration");
   Serial.println("set_maxtorque <0-1152> : Sets the maximum torque");
 }
-
-/**
- * @brief Prints help for Category 2.
- */
 void printHelp_Homing() {
   Serial.println("--- 2. Homing (Zero) Commands ---");
   Serial.println("set_zero               : Sets the current position as 0");
@@ -627,10 +518,6 @@ void printHelp_Homing() {
   Serial.println("set_zero_speed <0-4>   : Sets homing speed (0=fast, 4=slow)");
   Serial.println("set_zero_dir <0|1>     : Sets homing direction (0=CW, 1=CCW)");
 }
-
-/**
- * @brief Prints help for Category 3.
- */
 void printHelp_Feedback() {
   Serial.println("--- 3. Read (Feedback) Commands ---");
   Serial.println("read_encoder           : Reads the current encoder position");
@@ -640,20 +527,12 @@ void printHelp_Feedback() {
   Serial.println("read_protection_state  : Reads protection status (1=locked, 2=ok)");
   Serial.println("release_protection     : Releases motor from a locked-rotor fault");
 }
-
-/**
- * @brief Prints help for Category 4.
- */
 void printHelp_PID() {
   Serial.println("--- 4. Configuration (PID) Commands ---");
   Serial.println("set_kp <0-65535>       : Sets Proportional gain (Kp)");
   Serial.println("set_ki <0-65535>       : Sets Integral gain (Ki)");
   Serial.println("set_kd <0-65535>       : Sets Derivative gain (Kd)");
 }
-
-/**
- * @brief Prints help for Category 5.
- */
 void printHelp_Config() {
   Serial.println("--- 5. Configuration (Driver) Commands ---");
   Serial.println("calibrate              : Starts motor calibration (must be unloaded)");
@@ -670,4 +549,4 @@ void printHelp_Config() {
   Serial.println("set_address <0-9>      : Sets address index (0=e0... 9=e9)");
   Serial.println("save_spin_state        : Saves 'spin' command to run on boot");
   Serial.println("clear_spin_state       : Clears 'spin' command from boot");
-} 
+}

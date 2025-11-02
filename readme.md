@@ -2,18 +2,21 @@
 
 This is an Arduino sketch for the **ESP32 DOIT DEVKIT V1** that provides a full-featured, human-readable command interface for the MKS SERVO42C closed-loop stepper driver.
 
-Instead of needing to construct and send raw hexadecimal packets (e.g., `E0 F3 01 D4`), you can send intuitive commands like `enable` or `move 3200 30` directly from the Serial Monitor.
+This code acts as an advanced, **stateful** bridge. It translates intuitive commands (e.g., `move 3200 30`) into the binary packets required by the driver, handling all parsing, validation, and checksum calculation.
 
-This code acts as an advanced bridge, handling all command parsing, argument validation, and automatic 8-bit checksum calculation. It is intended to be a robust debugging tool, a foundation for a larger project, or a contribution to the MKS community.
+More importantly, it adds critical features *on top* of the driver's firmware, such as a **software-based absolute homing system** (`set_home`/`go_home`). This feature uses the driver's `read_pulses` (0x33) command to track the non-circular, 32-bit pulse counter, allowing it to return to a "zero" position across many rotations—a feature not available in the driver's default commands.
 
 This code is based on the **MKS SERVO42C V1.1.2 User Manual**.
 
 ## Features
 
 * **Human-Readable Commands:** Control the driver with simple strings (e.g., `set_kp 1500`) instead of hex.
-* **Full Command Implementation:** Includes all commands from the V1.1.2 manual (Motion, Homing, PID, Reading, and Configuration).
-* **Automatic Checksum:** The correct 8-bit additive checksum is automatically calculated and appended to every command.
-* **Data-Driven & Scalable:** The architecture uses `struct` arrays as "dictionaries" to map commands. Adding new commands is as simple as adding a new line to the array.
+* **Smart Response Parsing:** The code validates and interprets the driver's raw hex responses, printing human-readable output (e.g., `Command OK!` or `Absolute Position (pulses): 4096`).
+* **Software-Based Absolute Homing:** Adds `set_home` and `go_home <speed>` commands that use the reliable `read_pulses` counter for true, multi-rotation homing.
+* **Full Command Implementation:** Includes all commands from the V1.1.2 manual.
+* **Automatic Checksum:** The correct 8-bit additive checksum is automatically calculated for sending and validated on receiving.
+* **Firmware Bug Hotfixes:** Includes workarounds for known driver firmware bugs (like extra `0x00` bytes on responses) to ensure stable communication.
+* **Data-Driven & Scalable:** The architecture uses `struct` arrays as "dictionaries" to map commands, making the code clean and easy to add to.
 * **Robust Error Handling:** The parser returns specific error codes (e.g., `ERR_ARG_OUT_OF_RANGE`) and prints clear, helpful messages to the user.
 * **Interactive Help Menu:** A `help` command provides a multi-level menu to guide the user.
 * **Non-Blocking:** The code uses non-blocking logic to handle driver responses, ensuring the `loop()` is never stuck.
@@ -35,6 +38,7 @@ You **must** configure the driver itself using its onboard display and buttons (
 2.  Press the **`Menu`** button to enter settings.
 3.  Use the **`Next`** button to navigate to **`Mode`**.
 4.  Press **`Enter`**, use **`Next`** to select **`CR_UART`**, and press **`Enter`** to confirm.
+    * *(The factory default is `CR_vFOC`, which will ignore all serial commands).*
 5.  Use **`Next`** to navigate to **`UartBaud`**.
 6.  Press **`Enter`**, use **`Next`** to select **`38400`**, and press **`Enter`** to confirm.
     * *(This must match the `DRIVER_BAUD_RATE` define in the code).*
@@ -69,25 +73,41 @@ Connect the ESP32 to the driver's 4-pin `Usart (TTL)` port.
 
 The interface is controlled by sending commands over the Arduino Serial Monitor.
 
-* Type `help` to see the main category menu.
-* Type `help <number>` (e.g., `help 1`) to see the commands for that specific category.
+Type `help` to see the main category menu:
 
-### Command Categories
+--- MKS Controller Help Menu --- Usage: help <category_number>
 
-* `help 1`: Motion Commands (`enable`, `move`, `spin`, `set_acc`, etc.)
-* `help 2`: Homing (Zero) Commands (`set_zero`, `goto_zero`, etc.)
-* `help 3`: Read (Feedback) Commands (`read_encoder`, `read_error_angle`, etc.)
-* `help 4`: Configuration (PID) Commands (`set_kp`, `set_ki`, `set_kd`)
-* `help 5`: Configuration (Driver) Commands (`calibrate`, `set_work_mode`, `set_baud`, etc.)
+Motion Commands
+
+Homing (Zero) Commands
+
+Read (Feedback) Commands
+
+Configuration (PID) Commands
+
+Configuration (Driver) Commands
+
+Type `help 2` to see the crucial distinction between the two types of homing:
+
+--- 2. Homing (Zero) Commands --- 
+set_home                : (Software) Sets current pulse count as absolute 0. 
+go_home <speed>         : (Software) Returns to absolute 0 pulse count. 
+--- Driver-Internal Homing (Single-Rotation) --- 
+set_zero                : (Driver) Sets the current angle as 0 datum. 
+goto_zero               : (Driver) Returns to the 0 angle datum. 
+set_zero_mode <0-2>     : Sets driver homing mode (0=Off, 1=Dir, 2=Near).
+set_zero_speed <0-4>    : Sets driver homing speed (0=fast, 4=slow).
+set_zero_dir <0|1>      : Sets driver homing direction (0=CW, 1=CCW).
 
 ## To-Do / Future Improvements
 
 This code provides a solid foundation, but there is always room for improvement.
 
-* **Multi-Driver Support:** Refactor the code to manage multiple driver addresses. This would likely involve prefixing commands with the address (e.g., `e0 move 3200 30` or `e1 set_kp 1000`) and abstracting the `DRIVER_ADDR` constant out of the helper functions.
-* **Response Parsing & Validation:** Currently, the code prints the raw hex response (e.g., `Driver Response <- [ 0xE0 0x01 0xE1 ]`). A future improvement would be to parse this response, validate its checksum, and print a human-readable confirmation (e.g., `Command OK!` or `Encoder Value: 4096`).
-* **Automatic Polling:** Implement a non-blocking "auto-poll" feature (e.g., `poll_encoder 100`) that automatically requests data (like encoder position) at a set interval (e.g., every 100ms).
-* **Library Conversion:** Convert this standalone `.ino` sketch into a formal Arduino C++ library (a `.h` and `.cpp` file) with a class (e.g., `MKS_SERVO42C`) and public methods (e.g., `driver.move(3200, 30)`). This would be the ultimate step for usability in other projects.
+* **Min/Max Software Endstops:** Now that the ESP32 maintains `currentAbsolutePosition_pulses`, the next logical step is to add `set_min_pos` and `set_max_pos` commands. The `handleMoveCommand` could then check against these limits *before* sending a move to the driver.
+* **Multi-Driver Support:** Refactor the code to manage multiple driver addresses. This would likely involve prefixing commands with the address (e.g., `e0 move 3200 30` or `e1 set_kp 1000`) and abstracting the `DRIVER_ADDR` constant.
+* **Complete Response Parsing:** The code now parses `Status`, `Pulses`, `Encoder`, and `Error` responses. It should be expanded to parse all other responses and provide human-readable output for them.
+* **Automatic Polling:** Implement a non-blocking "auto-poll" feature (e.g., `poll_pulses 100`) that automatically requests data (like pulse position) at a set interval (e.g., every 100ms).
+* **Library Conversion:** Convert this standalone `.ino` sketch into a formal Arduino C++ library (a `.h` and `.cpp` file) with a class (e.g., `MKS_SERVO42C`) and public methods (e.g., `driver.goHome(30)`). This would be the ultimate step for usability in other projects.
 
 ## License
 

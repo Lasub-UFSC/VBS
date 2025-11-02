@@ -1,21 +1,22 @@
 /**
  * @file MKS_SERVO42C_UART_Bridge.ino
- * @version 1.4.4 (Smart Response Parser)
+ * @version 1.4.6 Absolute home
  * @author Lucas Barcaro (comments AI generated, if any error, please contact the author)
  * @date October 2025
  *
- * @brief This version adds a smart parser for driver responses.
- * Instead of printing raw hex bytes, it validates the checksum,
- * determines the message type based on its length, and prints a
- * human-readable interpretation.
+* @brief This version implements a software-based "absolute home"
+ * position, as the driver's built-in `goto_zero` is only a
+ * single-rotation reference.
  *
  * @features
- * - Human-readable command parser.
- * - Automatic checksum calculation (sending).
- * - Automatic checksum validation (receiving).
- * - Smart response parser (e.g., "Command OK", "Encoder Value: 16384").
- * - Data-driven routing for commands.
- * - Interactive 'help' menu.
+ * - New 'set_home' command to tare the absolute encoder position.
+ * - New 'go_home <speed>' command to return to that tare point
+ * from any number of rotations away.
+ * - Implements a state machine (`PendingAction`) to handle
+ * asynchronous request-response logic.
+ * - Refactors 'move' logic into a reusable `sendMovePacket()` function.
+ * - Upgrades 'parseEncoderResponse' to be the core of the state machine,
+ * updating global position and triggering callback functions.
  */
 
 // --- UART2 (Driver) Settings ---
@@ -42,6 +43,25 @@ const int8_t STATUS_OK             =  0;
 const int8_t ERR_UNKNOWN_COMMAND   = -1;
 const int8_t ERR_INVALID_ARGS      = -2;
 const int8_t ERR_ARG_OUT_OF_RANGE  = -3;
+
+// =================================================================
+// STATE MACHINE & ABSOLUTE POSITION GLOBALS (New)
+// =================================================================
+
+enum PendingAction {
+  NONE,
+  SET_HOME,
+  GO_HOME
+};
+PendingAction currentAction = NONE;
+
+int64_t absoluteHomeOffset = 0;
+
+int64_t currentAbsolutePosition = 0;
+
+bool positionIsKnown = false;
+
+int pendingGoHomeSpeed = 0;
 
 // =================================================================
 // COMMAND DICTIONARIES (Data-Driven Routing)
@@ -139,7 +159,7 @@ void loop() {
 }
 
 // =================================================================
-// MASTER COMMAND ROUTER
+// MASTER COMMAND ROUTER (Modified)
 // =================================================================
 void parseAndSendCommand(String line) {
   line.toLowerCase();
@@ -165,7 +185,14 @@ void parseAndSendCommand(String line) {
   } 
   else if (command == "spin") {
     returnVal = handleSpinCommand(args);
-  } 
+  }
+  // --- NEW ABSOLUTE HOME COMMANDS ---
+  else if (command == "set_home") {
+    returnVal = handleSetHome();
+  }
+  else if (command == "go_home") {
+    returnVal = handleGoHome(args);
+  }
   else {
     returnVal = findAndSendSingleByteArgCommand(command, args);
     if (returnVal == ERR_UNKNOWN_COMMAND) {
@@ -237,7 +264,7 @@ int8_t findAndSendSimpleCommand(String command) {
 }
 
 // =================================================================
-// COMMAND LOGIC HANDLERS (Unchanged from v4.3)
+// COMMAND LOGIC HANDLERS (Modified)
 // =================================================================
 int8_t handleHelpCommand(String args) {
     int8_t returnVal = STATUS_OK;
@@ -261,32 +288,78 @@ int8_t handleHelpCommand(String args) {
 }
 
 
+/**
+ * @brief (MODIFIED) 'move' handler. Now just parses args and calls sendMovePacket.
+ */
 int8_t handleMoveCommand(String args) {
   int8_t returnVal = ERR_INVALID_ARGS; 
   int spaceIndex = args.indexOf(' ');
+
   if (spaceIndex == -1) {
     Serial.println("Error: 'move' requires <pulses> and <speed> (e.g., move 3200 30)");
   } else {
     long pulses = args.substring(0, spaceIndex).toInt();
     int speed_raw = args.substring(spaceIndex + 1).toInt();
     byte speed_val = (byte)abs(speed_raw);
+
     if (speed_val > MAX_SPEED_VALUE) {
       Serial.println("Error: Speed must be between -" + String(MAX_SPEED_VALUE) + " and " + String(MAX_SPEED_VALUE));
       returnVal = ERR_ARG_OUT_OF_RANGE;
     } else {
-      byte packet[7]; 
-      packet[0] = DRIVER_ADDR;
-      packet[1] = 0xFD; 
-      byte direction = (pulses < 0) ? 1 : 0;
-      pulses = abs(pulses);
-      packet[2] = (direction << 7) | speed_val;
-      packet[3] = (pulses >> 24) & 0xFF;
-      packet[4] = (pulses >> 16) & 0xFF;
-      packet[5] = (pulses >> 8) & 0xFF;
-      packet[6] = pulses & 0xFF;         
-      sendPacketWithChecksum(packet, sizeof(packet));
+      // Logic refactored to sendMovePacket
+      sendMovePacket(pulses, speed_val);
       returnVal = STATUS_OK; 
     }
+  }
+  return returnVal;
+}
+
+/**
+ * @brief (NEW) Handler for 'set_home' command.
+ * Sets the state machine and triggers an encoder read.
+ */
+int8_t handleSetHome() {
+  if (currentAction != NONE) {
+    Serial.println("Error: Cannot set home, another action is pending.");
+    return ERR_INVALID_ARGS; // Technically a "busy" error
+  }
+  Serial.println("Action: Requesting current position to set as home...");
+  currentAction = SET_HOME;
+  triggerEncoderRead();
+  return STATUS_OK;
+}
+
+/**
+ * @brief (NEW) Handler for 'go_home' command.
+ * Sets the state machine, saves the speed, and triggers an encoder read.
+ */
+int8_t handleGoHome(String args) {
+  if (currentAction != NONE) {
+    Serial.println("Error: Cannot go home, another action is pending.");
+    return ERR_INVALID_ARGS; // "Busy"
+  }
+  if (!positionIsKnown) {
+    Serial.println("Error: Home position is not set. Use 'set_home' first.");
+    return ERR_INVALID_ARGS;
+  }
+  
+  int8_t returnVal = ERR_INVALID_ARGS;
+  int speed_raw = args.toInt();
+  byte speed_val = (byte)abs(speed_raw);
+
+  if (speed_raw == 0) {
+    Serial.println("Error: 'go_home' requires a non-zero speed (e.g., go_home 30)");
+  }
+  else if (speed_val > MAX_SPEED_VALUE) {
+    Serial.println("Error: Speed must be between 1 and " + String(MAX_SPEED_VALUE));
+    returnVal = ERR_ARG_OUT_OF_RANGE;
+  }
+  else {
+    Serial.println("Action: Requesting current position to calculate return move...");
+    pendingGoHomeSpeed = speed_val;
+    currentAction = GO_HOME;
+    triggerEncoderRead();
+    returnVal = STATUS_OK;
   }
   return returnVal;
 }
@@ -359,8 +432,80 @@ int8_t handleTwoByteArgCommand(String args, byte functionCode, long minVal, long
 
 
 // =================================================================
+// "CALLBACK" FUNCTIONS (Called by Response Handler)
+// =================================================================
+
+/**
+ * @brief (NEW) Called by parseEncoderResponse when state is SET_HOME.
+ * Sets the current position as the new absolute home offset.
+ */
+void executeSetHome() {
+  absoluteHomeOffset = currentAbsolutePosition;
+  positionIsKnown = true; // We now have a valid home
+  Serial.println(">>> Action: Software Home Set OK!");
+  Serial.println(">>> New Absolute Home Offset: " + String((long)absoluteHomeOffset));
+}
+
+/**
+ * @brief (NEW) Called by parseEncoderResponse when state is GO_HOME.
+ * Calculates and executes the relative move to return to home.
+ */
+void executeGoHome() {
+  // Calculate the relative move needed
+  // (Target) - (Current)
+  long relativeMove = (long)(absoluteHomeOffset - currentAbsolutePosition);
+
+  Serial.println(">>> Action: Go Home!");
+  Serial.println(">>>  Target Home: " + String((long)absoluteHomeOffset));
+  Serial.println(">>>  Current Pos: " + String((long)currentAbsolutePosition));
+  Serial.println(">>>  Calculated Relative Move: " + String(relativeMove) + " pulses.");
+  
+  if (relativeMove == 0) {
+    Serial.println(">>> Already at home position.");
+    return;
+  }
+
+  // Use the refactored move function to send the packet
+  sendMovePacket(relativeMove, pendingGoHomeSpeed);
+}
+
+
+// =================================================================
 // AUXILIARY FUNCTIONS (Communication & UI)
 // =================================================================
+
+/**
+ * @brief (NEW) Helper function to request an encoder update.
+ * This is the trigger for our state machine.
+ */
+void triggerEncoderRead() {
+  byte packet[] = {DRIVER_ADDR, 0x30};
+  sendPacketWithChecksum(packet, sizeof(packet));
+}
+
+/**
+ * @brief (REFACTORED) Central function to send a move (0xFD) packet.
+ * @param pulses The number of relative pulses to move (can be negative).
+ * @param speed The speed (0-127).
+ */
+void sendMovePacket(long pulses, int speed) {
+  byte packet[7]; 
+  packet[0] = DRIVER_ADDR;
+  packet[1] = 0xFD; // 'Run by serial' command
+
+  byte direction = (pulses < 0) ? 1 : 0;
+  pulses = abs(pulses);
+  byte speed_val = (byte)abs(speed) & 0x7F;
+  packet[2] = (direction << 7) | speed_val; // VAL byte
+
+  packet[3] = (pulses >> 24) & 0xFF; 
+  packet[4] = (pulses >> 16) & 0xFF;
+  packet[5] = (pulses >> 8) & 0xFF;
+  packet[6] = pulses & 0xFF;         
+  
+  sendPacketWithChecksum(packet, sizeof(packet));
+}
+
 void sendPacketWithChecksum(byte* packetData, int dataLength) {
   byte checksum = 0;
   Serial.print("Sending Packet:   [ ");
@@ -379,10 +524,12 @@ void sendPacketWithChecksum(byte* packetData, int dataLength) {
   Serial2.write(checksum);
 }
 
-
 // =================================================================
-// RESPONSE PARSING LOGIC (New)
+// RESPONSE PARSING LOGIC (Modified)
 // =================================================================
+/**
+ * @brief (MODIFIED) Handles responses and routes to the parser.
+ */
 void handleDriverResponses() {
   while (Serial2.available()) {
     if (rxBufferIndex < RX_BUFFER_SIZE) {
@@ -394,13 +541,11 @@ void handleDriverResponses() {
       lastByteTime = millis();
     }
   }
-
   if (rxBufferIndex > 0 && (millis() - lastByteTime > messageTimeout)) {
     parseAndPrintResponse(rxBuffer, rxBufferIndex);
     rxBufferIndex = 0;
   }
 }
-
 
 bool validateChecksum(byte* buffer, int length) {
   byte checksum = 0;
@@ -410,9 +555,10 @@ bool validateChecksum(byte* buffer, int length) {
   return (checksum == buffer[length - 1]);
 }
 
-
-void parseAndPrintResponse(byte* buffer, int length) {
-  if (!validateChecksum(buffer, length)) {
+/**
+ * @brief Helper function to print a checksum error.
+ */
+void printChecksumError(byte* buffer, int length) {
     Serial.print("Driver Response -> [ CHECKSUM ERROR! Data: ");
     for (int i = 0; i < length; i++) {
       Serial.print("0x");
@@ -421,18 +567,48 @@ void parseAndPrintResponse(byte* buffer, int length) {
       Serial.print(" ");
     }
     Serial.println("]");
+}
+
+/**
+ * @brief Helper function to print any unknown packet.
+ */
+void printRawHex(const char* message, byte* buffer, int length) {
+    Serial.print("Driver Response (" + String(message) + ") <- [ ");
+    for (int i = 0; i < length; i++) {
+      Serial.print("0x");
+      if (buffer[i] < 0x10) Serial.print("0");
+      Serial.print(buffer[i], HEX);
+      Serial.print(" ");
+    }
+    Serial.println("]");
+}
+
+/**
+ * @brief (MODIFIED) Main router for parsing responses.
+ * Routes based on message length.
+ */
+void parseAndPrintResponse(byte* buffer, int length) {
+  if (length == 9 && buffer[0] == DRIVER_ADDR && buffer[8] == 0x00) {
+    if (validateChecksum(buffer, 8)) {
+      parseEncoderResponse(buffer);
+      return;
+    } else {
+      printChecksumError(buffer, length);
+      return;
+    }
   }
 
   switch (length) {
     case 3:
-      parseStatusResponse(buffer);
+      parseStatusResponse(buffer); 
       break;
     case 4:
       parseAngleErrorResponse(buffer);
       break;
     case 8:
-      parseEncoderResponse(buffer);
+      parseEncoderResponse(buffer); // <-- THIS IS NOW THE STATE MACHINE CORE
       break;
+    // (Other parsers like read_pulses (5 bytes) can be added here)
     default:
       Serial.print("Driver Response (Unknown Format) <- [ ");
       for (int i = 0; i < length; i++) {
@@ -466,28 +642,49 @@ void parseStatusResponse(byte* buffer) {
 
 
 void parseEncoderResponse(byte* buffer) {
-  
+  // 1. Parse the 64-bit absolute position
   int32_t carry = (int32_t)(buffer[1] << 24 | buffer[2] << 16 | buffer[3] << 8 | buffer[4]);
   uint16_t value = (uint16_t)(buffer[5] << 8 | buffer[6]);
   
+  // The true absolute position is (carry * 65536) + value
+  currentAbsolutePosition = (int64_t)carry * 65536 + (int64_t)value;
+  positionIsKnown = true;
+  
+  // 2. Print human-readable output
   Serial.println("Driver Response -> Encoder Read:");
-  Serial.println("  Carry (Revolutions): " + String(carry));
+  Serial.println("  Carry (Revolutions): " + String((long)carry));
   Serial.println("  Value (Position 0-65535): " + String(value));
+  Serial.println("  >>> Absolute Position (pulses): " + String((long)currentAbsolutePosition));
+
+  // 3. --- STATE MACHINE LOGIC ---
+  // Check if this read was triggered by a command
+  switch (currentAction) {
+    case SET_HOME:
+      executeSetHome();
+      break;
+    case GO_HOME:
+      executeGoHome();
+      break;
+    case NONE:
+      // This was just a manual 'read_encoder' command. Do nothing.
+      break;
+  }
+  
+  // 4. Reset the state machine
+  currentAction = NONE;
 }
 
-
 void parseAngleErrorResponse(byte* buffer) {
-  int16_t error = (int16_t)(buffer[1] << 8 | buffer[2]);
-  
-  float error_degrees = (float)error / 182.044; 
+  int16_t error_raw = (int16_t)(buffer[1] << 8 | buffer[2]);
+  float error_degrees = (float)error_raw / 182.044; // 65536 / 360 = 182.044
   
   Serial.println("Driver Response -> Angle Error Read:");
-  Serial.println("  Raw Error Value: " + String(error));
+  Serial.println("  Raw Error Value: " + String(error_raw));
   Serial.println("  Angle Error (deg): " + String(error_degrees, 3));
 }
 
 // =================================================================
-// HELP MENU PRINTING FUNCTIONS
+// HELP MENU PRINTING FUNCTIONS (Modified)
 // =================================================================
 void printHelp_Main() {
   Serial.println("--- MKS Controller Help Menu ---");
@@ -512,15 +709,18 @@ void printHelp_Motion() {
 }
 void printHelp_Homing() {
   Serial.println("--- 2. Homing (Zero) Commands ---");
-  Serial.println("set_zero               : Sets the current position as 0");
-  Serial.println("goto_zero              : Moves to the 0 position");
-  Serial.println("set_zero_mode <0-2>    : Sets homing mode (0=Off, 1=Dir, 2=Near)");
-  Serial.println("set_zero_speed <0-4>   : Sets homing speed (0=fast, 4=slow)");
-  Serial.println("set_zero_dir <0|1>     : Sets homing direction (0=CW, 1=CCW)");
+  Serial.println("set_home               : (Software) Sets current pos as absolute 0.");
+  Serial.println("go_home <speed>        : (Software) Returns to absolute 0.");
+  Serial.println("--- Driver-Internal Homing (Single-Rotation) ---");
+  Serial.println("set_zero               : (Driver) Sets the current *angle* as 0 datum.");
+  Serial.println("goto_zero              : (Driver) Returns to the 0 *angle* datum.");
+  Serial.println("set_zero_mode <0-2>    : Sets driver homing mode (0=Off, 1=Dir, 2=Near)");
+  Serial.println("set_zero_speed <0-4>   : Sets driver homing speed (0=fast, 4=slow)");
+  Serial.println("set_zero_dir <0|1>     : Sets driver homing direction (0=CW, 1=CCW)");
 }
 void printHelp_Feedback() {
   Serial.println("--- 3. Read (Feedback) Commands ---");
-  Serial.println("read_encoder           : Reads the current encoder position");
+  Serial.println("read_encoder           : Reads absolute multi-rotation position");
   Serial.println("read_pulses            : Reads the received pulse counter");
   Serial.println("read_error_angle       : Reads the current angle error");
   Serial.println("read_en_status         : Reads the Enable pin status");

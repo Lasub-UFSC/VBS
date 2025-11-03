@@ -28,14 +28,14 @@
 // --- Receive Buffer Settings ---
 #define RX_BUFFER_SIZE 64
 byte rxBuffer[RX_BUFFER_SIZE];
-int rxBufferIndex 		   = 0;
-unsigned long lastByteTime 	   = 0;
-const long messageTimeout 	   = 20; // Use 20ms for a safer buffer capture
+int rxBufferIndex = 0;
+unsigned long lastByteTime = 0;
+const long messageTimeout = 20; // Use 20ms for a safer buffer capture
 
 // --- Driver Protocol Constants ---
-const byte DRIVER_ADDR  	   = 0xE0;
-const byte MAX_SPEED_VALUE 	   = 0x7F;
-const int MAX_TORQUE_VALUE 	   = 0x0480;
+const byte DRIVER_ADDR = 0xE0;
+const byte MAX_SPEED_VALUE = 0x7F;
+const int MAX_TORQUE_VALUE = 0x0480;
 
 // =================================================================
 // STATUS CODES
@@ -44,7 +44,7 @@ const int MAX_TORQUE_VALUE 	   = 0x0480;
  * @brief Defines the return codes for command parsing functions.
  * Provides detailed error feedback instead of a simple true/false.
  */
-const int8_t STATUS_OK             =  0; // Command successful and sent
+const int8_t STATUS_OK               =  0; // Command successful and sent
 const int8_t ERR_UNKNOWN_COMMAND   = -1; // Command string was not recognized
 const int8_t ERR_INVALID_ARGS      = -2; // Missing, empty, or malformed arguments
 const int8_t ERR_ARG_OUT_OF_RANGE  = -3; // Argument value is outside the allowed range
@@ -68,23 +68,23 @@ PendingAction currentAction = NONE;
  * @brief Stores the user-defined absolute "home" position (in pulses).
  * This is the value of the 'read_pulses' counter when 'set_home' is called.
  */
-int32_t absoluteHomeOffset_pulses 	= 0;
+int32_t absoluteHomeOffset_pulses = 0;
 
 /**
  * @brief Stores the last known absolute position from the pulse counter.
  */
-int32_t currentAbsolutePosition_pulses 	= 0;
+int32_t currentAbsolutePosition_pulses = 0;
 
 /**
  * @brief Flag to indicate if 'absoluteHomeOffset_pulses' holds a valid tare.
  */
-bool positionIsKnown 			= false;
+bool positionIsKnown = false;
 
 /**
  * @brief Stores the speed for the 'go_home' command, as it's
  * needed *after* the encoder response is received.
  */
-int pendingGoHomeSpeed 			= 0;
+int pendingGoHomeSpeed = 0;
 
 
 // =================================================================
@@ -102,21 +102,21 @@ struct SimpleCommand {
   int length;
 };
 const SimpleCommand simpleCommands[] = {
-  {"enable",       		{0xF3, 0x01}, 	2},
-  {"disable",      		{0xF3, 0x00}, 	2},
-  {"stop",         		{0xF7},       	1},
-  {"read_encoder", 		{0x30},       	1},
-  {"read_pulses",  		{0x33},       	1},
-  {"read_error_angle", 		{0x39},   	1},
-  {"read_en_status", 		{0x3A},     	1},
-  {"release_protection", 	{0x3D}, 	1},
-  {"read_protection_state", 	{0x3E},		1},
-  {"calibrate",    		{0x80, 0x00}, 	2},
-  {"restore_defaults", 		{0x3F},   	1},
-  {"set_zero",     		{0x91, 0x00}, 	2},
-  {"goto_zero",    		{0x94, 0x00}, 	2},
-  {"save_spin_state", 		{0xFF, 0xC8}, 	2},
-  {"clear_spin_state", 		{0xFF, 0xCA}, 	2}
+  {"enable",       {0xF3, 0x01}, 2},
+  {"disable",      {0xF3, 0x00}, 2},
+  {"stop",         {0xF7},       1},
+  {"read_encoder", {0x30},       1},
+  {"read_pulses",  {0x33},       1},
+  {"read_error_angle", {0x39},   1},
+  {"read_en_status", {0x3A},     1},
+  {"release_protection", {0x3D}, 1},
+  {"read_protection_state", {0x3E},1},
+  {"calibrate",    {0x80, 0x00}, 2},
+  {"restore_defaults", {0x3F},   1},
+  {"set_zero",     {0x91, 0x00}, 2},
+  {"goto_zero",    {0x94, 0x00}, 2},
+  {"save_spin_state", {0xFF, 0xC8}, 2},
+  {"clear_spin_state", {0xFF, 0xCA}, 2}
 };
 const int numSimpleCommands = sizeof(simpleCommands) / sizeof(simpleCommands[0]);
 
@@ -133,20 +133,20 @@ struct SingleByteArgCommand {
   const char* errorMsg; // Help text for error reporting
 };
 const SingleByteArgCommand singleByteCommands[] = {
-  {"set_motor_type", 	0x81, 0, 1, 	"type (0=0.9deg, 1=1.8deg)"	 },
-  {"set_work_mode",  	0x82, 0, 2, 	"mode (0=Open, 1=vFOC, 2=UART)"	 },
-  {"set_current",    	0x83, 0, 15, 	"current code (0-15)"		 },
-  {"set_subdivision",	0x84, 1, 255, 	"subdivision (1-255)"		 },
-  {"set_en_level",   	0x85, 0, 2, 	"level (0=L, 1=H, 2=Hold)"	 },
-  {"set_direction",  	0x86, 0, 1, 	"direction (0=CW, 1=CCW)"	 },
-  {"set_screen_sleep", 	0x87, 0, 1, 	"sleep (0=Off, 1=On)"		 },
-  {"set_protection", 	0x88, 0, 1, 	"protection (0=Off, 1=On)"	 },
-  {"set_interpolation", 0x89, 0, 1, 	"interpolation (0=Off, 1=On)"	 },
-  {"set_baud",       	0x8A, 1, 6, 	"baud index (1=9600... 6=115200)"},
-  {"set_address",    	0x8B, 0, 9, 	"address index (0=e0... 9=e9)"	 },
-  {"set_zero_mode",  	0x90, 0, 2, 	"mode (0=Disable, 1=Dir, 2=Near)"},
-  {"set_zero_speed", 	0x92, 0, 4, 	"speed (0=fast... 4=slow)" 	 },
-  {"set_zero_dir",   	0x93, 0, 1, 	"direction (0=CW, 1=CCW)"	 }
+  {"set_motor_type", 0x81, 0, 1, "type (0=0.9deg, 1=1.8deg)"},
+  {"set_work_mode",  0x82, 0, 2, "mode (0=Open, 1=vFOC, 2=UART)"},
+  {"set_current",    0x83, 0, 15, "current code (0-15)"},
+  {"set_subdivision",0x84, 1, 255, "subdivision (1-255)"},
+  {"set_en_level",   0x85, 0, 2, "level (0=L, 1=H, 2=Hold)"},
+  {"set_direction",  0x86, 0, 1, "direction (0=CW, 1=CCW)"},
+  {"set_screen_sleep", 0x87, 0, 1, "sleep (0=Off, 1=On)"},
+  {"set_protection", 0x88, 0, 1, "protection (0=Off, 1=On)"},
+  {"set_interpolation", 0x89, 0, 1, "interpolation (0=Off, 1=On)"},
+  {"set_baud",       0x8A, 1, 6, "baud index (1=9600... 6=115200)"},
+  {"set_address",    0x8B, 0, 9, "address index (0=e0... 9=e9)"},
+  {"set_zero_mode",  0x90, 0, 2, "mode (0=Disable, 1=Dir, 2=Near)"},
+  {"set_zero_speed", 0x92, 0, 4, "speed (0=fast... 4=slow)"},
+  {"set_zero_dir",   0x93, 0, 1, "direction (0=CW, 1=CCW)"}
 };
 const int numSingleByteCommands = sizeof(singleByteCommands) / sizeof(singleByteCommands[0]);
 
@@ -163,11 +163,11 @@ struct TwoByteArgCommand {
   const char* errorMsg; // Help text for error reporting
 };
 const TwoByteArgCommand twoByteCommands[] = {
-  {"set_kp",        0xA1, 0, 65535, 		"Kp (0-65535)"		},
-  {"set_ki",        0xA2, 0, 65535, 		"Ki (0-65535)"		},
-  {"set_kd",        0xA3, 0, 65535, 		"Kd (0-65535)"		},
-  {"set_acc",       0xA4, 0, 65535, 		"ACC (0-65535)"		},
-  {"set_maxtorque", 0xA5, 0, MAX_TORQUE_VALUE, 	"Max Torque (0-1152)"	}
+  {"set_kp",        0xA1, 0, 65535, "Kp (0-65535)"},
+  {"set_ki",        0xA2, 0, 65535, "Ki (0-65535)"},
+  {"set_kd",        0xA3, 0, 65535, "Kd (0-65535)"},
+  {"set_acc",       0xA4, 0, 65535, "ACC (0-65535)"},
+  {"set_maxtorque", 0xA5, 0, MAX_TORQUE_VALUE, "Max Torque (0-1152)"}
 };
 const int numTwoByteCommands = sizeof(twoByteCommands) / sizeof(twoByteCommands[0]);
 

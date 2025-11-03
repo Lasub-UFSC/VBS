@@ -4,7 +4,7 @@ This is an Arduino sketch for the **ESP32 DOIT DEVKIT V1** that provides a full-
 
 This code acts as an advanced, **stateful** bridge. It translates intuitive commands (e.g., `move 3200 30`) into the binary packets required by the driver, handling all parsing, validation, and checksum calculation.
 
-More importantly, it adds critical features *on top* of the driver's firmware, such as a **software-based absolute homing system** (`set_home`/`go_home`). This feature uses the driver's `read_pulses` (0x33) command to track the non-circular, 32-bit pulse counter, allowing it to return to a "zero" position across many rotations—a feature not available in the driver's default commands.
+More importantly, it adds critical features *on top* of the driver's firmware, such as a **software-based absolute homing system** (`set_home`/`go_home`). This feature uses the driver's `read_pulses` (0x33) command to track the non-circular, 32-bit pulse counter, allowing it to return to a "zero" position across many rotations— a feature not available in the driver's default commands.
 
 This code is based on the **MKS SERVO42C V1.1.2 User Manual**.
 
@@ -25,7 +25,7 @@ This code is based on the **MKS SERVO42C V1.1.2 User Manual**.
 
 * **ESP32 DOIT DEVKIT V1** (or similar ESP32 board)
 * **MKS SERVO42C** Closed-Loop Driver (V1.1.x firmware)
-* Dupont-style Jumper Wires
+* Jumper Wires
 * 12V-24V Power Supply for the driver
 
 ## Setup & Installation
@@ -51,11 +51,11 @@ You **must** configure the driver itself using its onboard display and buttons (
 
 Connect the ESP32 to the driver's 4-pin `Usart (TTL)` port.
 
-| ESP32 Pin | Driver Pin | Description |
-| :--- | :--- | :--- |
-| `GND` | `G` (GND) | Common Ground |
-| `GPIO 17` (TX) | `RX` | ESP32 Transmit -> Driver Receive |
-| `GPIO 16` (RX) | `TX` | ESP32 Receive <- Driver Transmit |
+| ESP32 Pin      | Driver Pin | Description                      |
+| :-------------:| :--------: | :-------------------------------:|
+| `GND`          | `G` (GND)  | Common Ground                    |
+| `GPIO 17` (TX) | `RX`       | ESP32 Transmit -> Driver Receive |
+| `GPIO 16` (RX) | `TX`       | ESP32 Receive <- Driver Transmit |
 
 **Note:** If you get no responses, try swapping the `RX` and `TX` pins.
 
@@ -77,15 +77,15 @@ Type `help` to see the main category menu:
 
 --- MKS Controller Help Menu --- Usage: help <category_number>
 
-Motion Commands
+(1) Motion Commands
 
-Homing (Zero) Commands
+(2) Homing (Zero) Commands
 
-Read (Feedback) Commands
+(3) Read (Feedback) Commands
 
-Configuration (PID) Commands
+(4) Configuration (PID) Commands
 
-Configuration (Driver) Commands
+(5) Configuration (Driver) Commands
 
 Type `help 2` to see the crucial distinction between the two types of homing:
 
